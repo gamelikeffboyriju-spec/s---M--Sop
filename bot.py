@@ -38,7 +38,7 @@ from telegram.error import RetryAfter, TelegramError
 # CONFIG
 # ============================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8421885425:AAGDsQV5s8BusBIPBlvIhLJ3wMOH92hGugo")
-ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()]
+ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6840524720").split(",") if x.strip().isdigit()]
 
 SMS_GROUP_LINK = os.getenv("SMS_GROUP_LINK", "https://t.me/fire_x_otp_group")
 SMS_GROUP_ID = os.getenv("SMS_GROUP_ID", "-1003870313704")
