@@ -820,14 +820,19 @@ async def initial_sync():
 async def forward_loop(app: Application):
     global FORWARDER_RUNNING
     FORWARDER_RUNNING = True
-    logger.info("📡 SMS Forwarder started (STRICT new-only mode)")
+    logger.info("📡 SMS Forwarder started (STRICT timestamp mode)")
     
     await asyncio.sleep(5)
     await initial_sync()
     
+    # Grace period: ignore any SMS older than this (in seconds)
+    MAX_MSG_AGE_SEC = 120  # 2 minutes
+    
     while FORWARDER_RUNNING:
         try:
             all_accounts = DB.get('accounts', {})
+            now_ts = time.time()  # current unix time
+            
             for uid_str, accs in list(all_accounts.items()):
                 for acc in accs:
                     try:
@@ -835,61 +840,49 @@ async def forward_loop(app: Application):
                         for dev in devices:
                             acc_id = f"{acc['url']}|{dev['id']}"
                             seen = DB.get('seen_msgs', {})
-                            seen_data = seen.get(acc_id)
-                            
-                            # If no seen data, initialize silently (no forward)
-                            if not seen_data:
-                                if dev.get('messages'):
-                                    seen[acc_id] = {
-                                        'last_key': dev['messages'][-1]['key'],
-                                        'last_ts': BOT_START_TS,
-                                    }
-                                    DB['seen_msgs'] = seen
-                                    save_data(DB)
-                                continue
-                            
+                            seen_data = seen.get(acc_id, {})
                             last_key = seen_data.get('last_key', '')
-                            last_ts = seen_data.get('last_ts', BOT_START_TS)
                             
-                            # STRICT FILTER: only messages with:
-                            # 1. key > last_key (newer in Firebase)
-                            # 2. AND timestamp > last_ts (newer in real time)
                             new_msgs = []
+                            
                             for m in dev.get('messages', []):
-                                # Must be strictly newer by key
+                                # Skip if already seen by key
                                 if last_key and m['key'] <= last_key:
                                     continue
                                 
-                                # Check timestamp if available
-                                msg_ts = parse_msg_timestamp(m['time_str'])
-                                if msg_ts is not None and msg_ts < last_ts:
-                                    # Too old — skip
+                                # ✅ TIMESTAMP CHECK — critical
+                                msg_ts_ms = parse_msg_timestamp(m['time_str'])
+                                if msg_ts_ms is None:
+                                    # Can't parse time → try Firebase key
+                                    key_ts = get_firebase_key_timestamp(m['key'])
+                                    if key_ts is None:
+                                        continue  # Skip unknown
+                                    msg_ts_ms = key_ts
+                                
+                                msg_age_sec = (time.time() * 1000 - msg_ts_ms) / 1000
+                                
+                                # ✅ REJECT if older than grace period
+                                if msg_age_sec > MAX_MSG_AGE_SEC:
+                                    logger.debug(f"Skip old: {msg_age_sec:.0f}s old — {m['sender']}")
                                     continue
                                 
-                                # Check Firebase key timestamp if numeric
-                                key_ts = get_firebase_key_timestamp(m['key'])
-                                if key_ts is not None and key_ts < BOT_START_TS:
-                                    # Created before bot started — skip
-                                    continue
-                                
+                                # ✅ ACCEPT — recent enough
                                 new_msgs.append(m)
                             
-                            # Update seen
+                            # Update seen pointer
                             if dev.get('messages'):
-                                latest = dev['messages'][-1]
-                                latest_ts = parse_msg_timestamp(latest['time_str'])
                                 seen[acc_id] = {
-                                    'last_key': latest['key'],
-                                    'last_ts': latest_ts if latest_ts else max(last_ts, time.time() * 1000),
+                                    'last_key': dev['messages'][-1]['key'],
+                                    'last_ts': time.time(),
                                 }
                                 DB['seen_msgs'] = seen
                                 save_data(DB)
                             
-                            # Forward new ones
+                            # Forward
                             for m in new_msgs:
-                                logger.info(f"📨 NEW SMS: {m['sender']} @ {m['time_str']}")
+                                logger.info(f"📨 NEW SMS ({int((time.time()*1000 - (parse_msg_timestamp(m['time_str']) or 0))/1000)}s old): {m['sender']}")
                                 await forward_sms_to_group(app, dev, m)
-                                await asyncio.sleep(0.8)
+                                await asyncio.sleep(1.0)
                         
                     except Exception as e:
                         logger.error(f"Forward: {e}")
